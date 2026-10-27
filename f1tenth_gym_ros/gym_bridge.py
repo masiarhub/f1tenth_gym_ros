@@ -37,6 +37,7 @@ from geometry_msgs.msg import Twist
 from geometry_msgs.msg import TransformStamped
 from geometry_msgs.msg import Transform
 from ackermann_msgs.msg import AckermannDriveStamped
+from std_msgs.msg import Empty, UInt8MultiArray
 from f110_msgs.msg import WpntArray
 from stack_master.qos import LATCHED_QOS
 from tf2_ros import TransformBroadcaster
@@ -111,6 +112,10 @@ class GymBridge(Node):
 
         self.set_descriptor(name='kb_teleop', descriptor=ParameterDescriptor(
             type=ParameterType.PARAMETER_BOOL, description="Whether teleop is enabled"))
+
+        # start gate: hold the physics until /sim/start arrives, so all stacks can come up before t=0
+        self.start_gate = self.get_parameter('start_gate').value if self.has_parameter('start_gate') else False
+        self.started = not self.start_gate
 
         # check num_agents
         num_agents = self.get_parameter('num_agent').value
@@ -206,6 +211,8 @@ class GymBridge(Node):
         # publishers
         self.ego_scan_pub = self.create_publisher(
             LaserScan, ego_scan_topic, 10)
+        # per-step collision flags of the gym (car-car or car-wall), [ego, opp]
+        self.collision_pub = self.create_publisher(UInt8MultiArray, '/sim/collisions', 10)
         self.ego_odom_pub = self.create_publisher(Odometry, ego_odom_topic, 10)
         self.ego_pose_pub = self.create_publisher(PoseStamped, ego_pose_topic, 10)
         self.ego_drive_published = False
@@ -254,12 +261,21 @@ class GymBridge(Node):
                 self.opp_reset_callback,
                 10)
 
+        if self.start_gate:
+            self.start_sub = self.create_subscription(Empty, '/sim/start', self.start_callback, 10)
+            self.get_logger().info("Start gate active, waiting for /sim/start")
+
         if self.get_parameter('kb_teleop').value:
             self.teleop_sub = self.create_subscription(
                 Twist,
                 '/cmd_vel',
                 self.teleop_callback,
                 10)
+
+    def start_callback(self, _):
+        if not self.started:
+            self.started = True
+            self.get_logger().info("Start gate opened")
 
     def drive_callback(self, drive_msg):
         self.ego_requested_speed = drive_msg.drive.speed
@@ -291,11 +307,13 @@ class GymBridge(Node):
         if self.spawned_on_raceline or not wpnts_msg.wpnts:
             return
         self.spawned_on_raceline = True  # only once, later raceline updates must not teleport the car
-        w = wpnts_msg.wpnts[0]
+        track_length = wpnts_msg.wpnts[-1].s_m
+        ego_s = (self.get_parameter('ego_spawn_s').value if self.has_parameter('ego_spawn_s') else 0.0) % track_length
+        w = min(wpnts_msg.wpnts, key=lambda p: abs(p.s_m - ego_s))
         if self.has_opp:
             # opponent on the raceline too, opp_spawn_s [m] ahead of the ego (sx1/sy1/stheta1 are only the fallback)
-            opp_s = (self.get_parameter('opp_spawn_s').value if self.has_parameter('opp_spawn_s') else 5.0) \
-                % wpnts_msg.wpnts[-1].s_m
+            opp_s = (ego_s + (self.get_parameter('opp_spawn_s').value if self.has_parameter('opp_spawn_s') else 5.0)) \
+                % track_length
             o = min(wpnts_msg.wpnts, key=lambda p: abs(p.s_m - opp_s))
             self.obs, _, self.done, _ = self.env.reset(
                 poses=np.array([[w.x_m, w.y_m, w.psi_rad], [o.x_m, o.y_m, o.psi_rad]]))
@@ -303,7 +321,7 @@ class GymBridge(Node):
         else:
             self.obs, _, self.done, _ = self.env.reset(
                 poses=np.array([[w.x_m, w.y_m, w.psi_rad]]))
-        self.get_logger().info(f"Spawned ego on raceline s=0: x={w.x_m:.2f} y={w.y_m:.2f} yaw={w.psi_rad:.2f}")
+        self.get_logger().info(f"Spawned ego on raceline s={w.s_m:.2f}: x={w.x_m:.2f} y={w.y_m:.2f} yaw={w.psi_rad:.2f}")
 
     def opp_reset_callback(self, pose_msg):
         if self.has_opp:
@@ -331,15 +349,18 @@ class GymBridge(Node):
             self.ego_steer = 0.0
 
     def drive_timer_callback(self):
-        if self.ego_drive_published and not self.has_opp:
+        # physics stays frozen until the start gate opens (topics keep publishing the spawn state)
+        step = self.started and self.ego_drive_published
+        if step and not self.has_opp:
             self.obs, _, self.done, _ = self.env.step(
                 np.array([[self.ego_steer, self.ego_requested_speed]]))
         # opp keeps its 0, 0 default command until it publishes, so the ego is simulated anyway
-        elif self.ego_drive_published and self.has_opp:
+        elif step and self.has_opp:
             self.obs, _, self.done, _ = self.env.step(np.array(
                 [[self.ego_steer, self.ego_requested_speed], [self.opp_steer, self.opp_requested_speed]]))
         self.ts = self.get_clock().now().to_msg()
         self._update_sim_state()
+        self.collision_pub.publish(UInt8MultiArray(data=[int(c) for c in self.obs['collisions']]))
 
     def scan_timer_callback(self):
         # pub scans
